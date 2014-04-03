@@ -1,0 +1,829 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jan 14 15:46:29 2014
+
+@author: quare
+"""
+
+import pddl_parser.Data_Structures as ds
+import ParserStrip as ps
+import copy
+import sys
+
+
+class New_Model():
+    def __init__(self,new_dom=None,new_prob=None):
+        self.new_dom=new_dom
+        self.new_prob=new_prob
+        self.S=[] #safe operators
+        self.V_and_T=[]
+    
+    def save_in_memory(self,directory,domain_filename,problem_filename):
+        try:
+            dom_f=open(directory+domain_filename,"r")
+        except IOError:
+            print "ERROR: File '", directory+domain_filename , "' not found"
+            sys.exit()
+    
+        try:
+            prob_f=open(directory+problem_filename,"r")
+        except IOError:
+            print "ERROR: File '", directory+problem_filename , "' not found"
+            sys.exit()
+    
+        self.new_dom=ps.strips_parsing(dom_f) #parsing and data structuring for the domain
+        dom_f.close()
+
+        self.new_prob=ps.strips_parsing(prob_f) #parsing and data structuring for the problem
+       
+        prob_f.close()
+    
+    def separation_in_operator_classes(self):
+        actions=self.new_dom.actions
+        sac=self.new_prob.soft_always_constraints
+        
+        for a in actions:
+            for c in sac:
+                viol_bool=False
+                threat_bool=False
+                safe_bool=True
+                for i in range(0,len(c.L)):
+                    #check violation
+                    
+                    if (c.L_bar[i]<=a.Z and not c.L_bar[i]<=a.precond):
+                        
+                        viol_bool=True
+                        break
+                    #check threat
+                    if (not threat_bool) and ( len(c.L_bar[i] & a.Z)!=0 and len(c.L[i] & a.Z)==0 and not c.L_bar[i]<=a.precond ):
+                        threat_bool=True
+                    #check safe
+                    if safe_bool and not ( len(c.L_bar[i] & a.Z)==0 or len(c.L[i] & a.Z)!=0 ):
+                        safe_bool=False
+                
+                if viol_bool:
+                    a.V.append(c) #add constraint to the violations of the operator
+                    c.V_op.append(a) #add operation to the violating operator of the constraint
+                    
+                elif threat_bool:
+                    a.T.append(c)    #add constraint to the threats of the operator
+                    c.T_op.append(a) #add operation to the threating operator of the constraint
+                    
+                elif safe_bool:
+                    a.S.append(c)   #add constraint to the safe constraints for the operator
+                    c.S_op.append(a) #add operation to the safe operators of the constraint
+            
+        for a in actions:
+            if a.V!=[] or a.T!=[]:
+                self.V_and_T.append(a)
+            else:
+                self.S.append(a)
+        
+                    
+    def compile_model(self):
+        F=self.new_dom.predicates                   #set of Literal
+        I=self.new_prob.init_state                  #set of Literal
+        G=self.new_prob.goal_state                  #set of Literal
+        O=self.new_dom.actions                      #list actions
+        AG=self.new_prob.soft_always_constraints    #list of sac
+        AV=set()
+        D=set()
+        C_p=set()
+        Cbar_p=set()
+        M=[] #forgo,collect        
+        
+        VandT=self.V_and_T #list of not safe actions
+        
+        end_mode=ds.Literal("end-mode")
+        normal_mode=ds.Literal("normal-mode")
+        pause=ds.Literal("pause")
+        not_pause=copy.copy(pause).negate()
+        not_normal_mode=copy.copy(normal_mode)
+        not_normal_mode.negate()
+        
+               
+        for s_act in self.S:
+            s_act.precond.add(normal_mode)
+            s_act.precond.add(not_pause)
+        
+        
+        end_eff=set([end_mode,not_normal_mode])
+        end_prec=set([normal_mode])
+        end=New_Action(tup=('end',end_prec,end_eff))
+                
+        
+        for c in AG:
+            ag_viol=ds.Literal("ag-violated-"+c.name)
+            ag_prime=ds.Literal("ag-prime-"+c.name)
+            ag_prime_bar=ds.Literal("ag-primebar-"+c.name)
+            
+            
+            AV.add(ag_viol)
+            D.add(ds.Literal("ag-done-"+c.name))
+            C_p.add(ag_prime)
+            Cbar_p.add(ag_prime_bar)
+            
+            not_ag_prime_bar=copy.copy(ag_prime_bar).negate()  
+            not_ag_viol=copy.copy(ag_viol).negate() 
+
+            increase_eff=ds.Literal("increase (total-cost) 1")            
+            
+            #collect_op/forgo_op
+            prec_collect=set([end_mode,not_ag_viol,ag_prime_bar])
+            prec_forgo=set([end_mode,ag_viol,ag_prime_bar])
+            eff_coll=set([ag_prime,not_ag_prime_bar])
+            eff_forg=set([ag_prime,not_ag_prime_bar,increase_eff]) #,increase_eff
+            M.append(New_Action(tup=('collect-ag-'+c.name,prec_collect,eff_coll)))
+            M.append(New_Action(tup=('forgo-ag-'+c.name,prec_forgo,eff_forg)))
+            
+
+        Fsplit,Ocomp=self.operator_tranformation(VandT) #list of modified actions
+                
+        init_cost=ds.Literal("= (total-cost) "+str(self.new_prob.initial_cost))       
+        
+        Fprime= F | Fsplit | set([pause]) | AV | D | C_p | Cbar_p | set([normal_mode,end_mode])
+        Iprime= I | set([init_cost]) | Cbar_p | set([normal_mode])
+        Gprime= G | C_p
+        
+        #Compile without _bar operations
+        #O2=[]
+        #for o in Ocomp:
+        #    if o.name[-3:]!="bar":
+        #        O2.append(o)
+        #Ocomp=O2
+        
+        
+        Oprime = self.S + [end] + Ocomp + M
+        
+        comp_dom=New_Domain()
+        comp_prob=New_Problem()
+        
+        comp_dom.actions=Oprime
+        comp_dom.predicates=Fprime
+        comp_dom.name="compiled-"+self.new_dom.name
+        comp_dom.functions=[]
+        
+        comp_prob.domain_name= "compiled-"+self.new_prob.domain_name
+        comp_prob.name="compiled-"+self.new_prob.name
+        comp_prob.goal_state=Gprime
+        comp_prob.init_state=Iprime
+        
+        return New_Model(comp_dom,comp_prob)
+        
+    
+    def operator_tranformation(self,viol_threat_op):
+                       
+        Ocomp=[]  #resulting list of actions
+        o_viol_list=[]
+        
+        
+        #some constant literals
+        pause=ds.Literal("pause")
+        not_pause=copy.copy(pause).negate()
+        normal_mode=ds.Literal("normal-mode")
+        
+        F=set() #non-split predicates
+      
+        for o in viol_threat_op: #for each not safe operation 
+            o_threat_list=[]
+            
+            if(len(o.T)>0):            
+                #some literals
+                
+                non_split=ds.Literal("non-split-"+o.name)
+                not_non_split=copy.copy(non_split).negate() 
+                F.add(non_split)
+                i=0 #index constraint
+            for AG in o.T: #for each soft always constraint that is threated the operation
+                #some constant literal
+                ag_viol=ds.Literal("ag-violated-"+AG.name)
+                ag_done=ds.Literal("ag-done-"+AG.name)
+                
+                
+                if i>0:
+                    ag_done_pre=ds.Literal("ag-done-"+o.T[i-1].name)
+                    not_ag_done_pre=copy.copy(ag_done_pre).negate()
+                
+                NAG_list=[]
+                AAG_list=[]
+                AAG_bar_list=[]
+                for j in range(0,len(AG.L)): #for each disjunction in AG
+                    #calculate NAG set                    
+                    NAG_temp=AG.L_bar[j] & o.eff #intersection between notL and operator effects
+                    
+                    #NAG is composed by elements of L, not of L_bar: so negate
+                    NAG=negateSet(NAG_temp) 
+                                        
+                    NAG_list.append(NAG) #include the NAG set for each disjunction of the same AG
+                    
+                    #calculate AAG, as definition
+                    AAG=AG.L[j] - NAG
+                    AAG_list.append(AAG)
+                    
+                    #calculate AAG_bar
+                    AAG_bar=negateSet(AAG)
+                    AAG_bar_list.append(AAG_bar)
+                    
+                #operator definitions
+                
+                if len(o.T)==1:
+                    
+                    #oAG0
+                    name_op=o.name+"-"+AG.name #name new op
+                    eff_op=o.eff | set([ag_done]) #effects
+                    precond_op=o.precond | set([not_pause,normal_mode]) #precondition set
+                    disjunctive_precond_op=AAG_list #disjunction inside the precondition
+                   
+                    disjunctive_precond_op,precond_op=resolution(disjunctive_precond_op,precond_op) #resolution
+                   
+                    if disjunctive_precond_op is not None or precond_op is not None: #impossible action because of preconditions and AAG_list conjunction
+                        o_ag_i=New_Action(None,(name_op,precond_op,eff_op),disjunctive_precond_op)
+                        o_threat_list.append(o_ag_i) #add action to the result list
+                    
+                    
+                    #obar_AG0
+                    name_op_bar=o.name+"-"+AG.name+"-bar"
+                    eff_op_bar=o.eff | set([ag_done,ag_viol])
+                    precond_op_bar=o.precond | set([not_pause,normal_mode])
+                                   
+                    disjunctive_precond_op_bar=distribute(AAG_bar_list,precond_op_bar)
+                    #disjunctive_precond_op_bar,precond_op_bar=resolution(disjunctive_precond_op_bar,precond_op_bar) #resolution
+                    if disjunctive_precond_op_bar is not None or precond_op_bar is not None:
+                        o_bar_ag_i=New_Action(None,(name_op_bar,set(),eff_op_bar),disjunctive_precond_op_bar)
+                        o_threat_list.append(o_bar_ag_i)
+                    
+                elif i==0:
+                    #oAG0
+                    name_op=o.name+"-"+AG.name #name new op
+                    eff_op=set([ag_done,pause,non_split]) #effects
+                    precond_op=o.precond | set([not_pause,normal_mode]) #precondition set
+                    disjunctive_precond_op=AAG_list #disjunction inside the precondition
+                                     
+                    disjunctive_precond_op,precond_op=resolution(disjunctive_precond_op,precond_op) #resolution
+                    if disjunctive_precond_op is not None or precond_op is not None:
+                        o_ag_i=New_Action(None,(name_op,precond_op,eff_op),disjunctive_precond_op)
+                        o_threat_list.append(o_ag_i) #add action to the result list
+                    
+                    #obar_AG0
+                    name_op_bar=o.name+"-"+AG.name+"-bar"
+                    eff_op_bar=set([ag_done,pause,ag_viol,non_split])
+                    precond_op_bar=o.precond | set([not_pause,normal_mode])
+                   
+                    disjunctive_precond_op_bar=distribute(AAG_bar_list,precond_op_bar)
+                    #disjunctive_precond_op_bar,precond_op_bar=resolution(disjunctive_precond_op_bar,precond_op_bar) #resolution
+                    if disjunctive_precond_op_bar is not None or precond_op_bar is not None:
+                        o_bar_ag_i=New_Action(None,(name_op_bar,set(),eff_op_bar),disjunctive_precond_op_bar)
+                        o_threat_list.append(o_bar_ag_i)
+                        i=i+1
+                    else:
+                        break
+                elif i==(len(o.T)-1): #last constraint
+                    #oAGm
+                    name_op=o.name+"-"+AG.name
+                    eff_op=o.eff | set([ag_done,not_pause,not_non_split,not_ag_done_pre])
+                    precond_op= set([pause, ag_done_pre,non_split,normal_mode])
+                    disjunctive_precond_op=AAG_list
+                    
+                    disjunctive_precond_op,precond_op=resolution(disjunctive_precond_op,precond_op) #resolution
+                    
+                    o_ag_i=New_Action(None,(name_op,precond_op,eff_op),disjunctive_precond_op)
+                    
+                    o_threat_list.append(o_ag_i)
+                    
+                    #obar_AGm
+                    name_op_bar=o.name+"-"+AG.name+"-bar"
+                    eff_op_bar=o.eff | set([ag_done,not_pause,ag_viol,not_non_split])
+                    precond_op_bar=set([pause,non_split,ag_done_pre,normal_mode])
+                    disjunctive_precond_op_bar=distribute(AAG_bar_list,precond_op_bar)
+                    #disjunctive_precond_op_bar,precond_op_bar=resolution(disjunctive_precond_op_bar,precond_op_bar) #resolution
+                    o_bar_ag_i=New_Action(None,(name_op_bar,set(),eff_op_bar),disjunctive_precond_op_bar)
+                    
+                    o_threat_list.append(o_bar_ag_i)
+                    
+                else: #the other constraints in the middle
+                    #oAGk
+                    name_op=o.name+"-"+AG.name
+                    eff_op=set([ag_done,not_ag_done_pre])
+                    precond_op= set([pause, ag_done_pre,non_split,normal_mode])
+                    disjunctive_precond_op=AAG_list
+                    disjunctive_precond_op,precond_op=resolution(disjunctive_precond_op,precond_op) #resolution
+                    o_ag_i=New_Action(None,(name_op,precond_op,eff_op),disjunctive_precond_op)
+                    
+                    o_threat_list.append(o_ag_i)
+                    
+                    #obar_AGk
+                    name_op_bar=o.name+"-"+AG.name+"-bar"
+                    eff_op_bar=set([ag_done,ag_viol])
+                    precond_op_bar=set([pause,non_split,ag_done_pre,normal_mode])
+                    disjunctive_precond_op_bar=distribute(AAG_bar_list,precond_op_bar)
+                    #disjunctive_precond_op_bar,precond_op_bar=resolution(disjunctive_precond_op_bar,precond_op_bar) #resolution
+                    o_bar_ag_i=New_Action(None,(name_op_bar,set(),eff_op_bar),disjunctive_precond_op_bar)
+                    
+                    o_threat_list.append(o_bar_ag_i)
+                    i=i+1
+        
+            #End Threat operators
+            
+            #Violations
+            test_viol=False
+            for AG in o.V:
+                #some constant literal
+                ag_viol=ds.Literal("ag-violated-"+AG.name)
+                if (len(o.T)==0): #only violation
+                    o.eff.add(ag_viol)
+                    o.precond.add(normal_mode)
+                    test_viol=True
+                else: #add ag-violated literal to the effects of the first pair of threatened constraints
+                    o_threat_list[0].eff.add(ag_viol)
+                    o_threat_list[1].eff.add(ag_viol)
+            if test_viol:
+                o_viol_list.append(o)
+            
+            Ocomp.extend(o_threat_list)
+            
+            if len(o.V)>0 and len(o.T)>0:
+                print("Threat and Violation: "+o.name)
+            elif len(o.T)>0:
+                    print("Threat: "+o.name)
+            elif len(o.V)>0:
+                    print("Violation:"+o.name)
+            
+        print("Violation or threats founded: "+str(len(viol_threat_op)))  
+        print("Added operators for threats: "+str(len(Ocomp)))
+        print("Added operators for violations: "+str(len(o_viol_list)))
+        return F,Ocomp+o_viol_list
+        
+
+class New_Domain():
+    
+    def __init__(self,name=None,predicates=None,actions=None):
+        self.name=name
+        self.predicates=predicates
+        self.actions=actions
+        self.functions=None
+    
+    def __str__(self):
+        
+        string="(define (domain "+self.name+")\n"
+        string+="(:requirements :adl :fluents)\n"
+        if len(self.predicates)!=0:
+            string+="(:predicates"
+            for p in self.predicates:
+                string+="\n\t"+str(p)
+            string+=")\n"
+        
+        string+="(:functions (total-cost))\n"
+        
+        for a in self.actions:
+            string+=str(a)
+        
+        string+=")"
+        
+        return string
+
+
+class New_Problem():
+    
+    def __init__(self,name=None,dom_name=None,init_s=None,goal_s=None):
+        self.name=name
+        self.domain_name=dom_name
+        self.init_state=init_s
+        self.goal_state=goal_s
+        self.soft_always_constraints=[]
+        self.always_constraints=[]  
+        self.initial_cost=0
+    
+    def join_pddl(self, model_pddl, dom):             
+        constraints=model_pddl.prob.constraints #constraints of the original problem
+        obj=model_pddl.prob.ob #objects of the problem
+        static_lit=model_pddl.dom.invariants
+        init=model_pddl.prob.init_state
+        static_init=[]
+        for i in init:
+            if static_lit.has_key(i.predicate):
+                static_init.append(i)
+                
+        pred=dom.predicates
+        
+        constraints.convert2CNF_without_distribution(obj) #constraints converted in a proposition with only AND, OR, PREFERENCE, ALWAYS
+                
+        proposition=constraints.proposition #constraint proposition
+            
+        #the proposition should be: or a AND sentence, or a PREFERENCE, or a TRAJECTORY sentence (always,sometimes,etc..)
+            
+        #separation in different types of constraint
+        sac=[]
+        ac=[]
+            
+        #only one ALWAYS sentence
+        if isinstance(proposition,ds.Trajectory_GD):
+            ac.append(unpack_Constraint(proposition))
+        elif isinstance(proposition,ds.Preference): #only one PREFERENCE
+            s=Soft_Always_Constr(unpack_Constraint(proposition.gd),proposition.name,static_init,static_lit,pred)
+            if s.L is None:
+                print "A constraint has been removed because always violated"
+            elif s.L==[]:
+                print "A constraint has been removed because it can not be violated"
+            else:
+                if s not in sac:
+                    sac.append(s)
+                else:
+                    print "A constraint has been removed for redundancy"
+        elif isinstance(proposition,ds.And_Or_GD): #more constraints
+            for gd in proposition.gd_list:                
+                if isinstance(gd,ds.Trajectory_GD):
+                    ac.append(unpack_Constraint(gd))
+                elif isinstance(gd,ds.Preference):
+                    s=Soft_Always_Constr(unpack_Constraint(gd.gd),gd.name,static_init,static_lit,pred)
+                    if s.L is None:
+                        print "A constraint has been removed because always violated"
+                        self.initial_cost=self.initial_cost+1
+                    elif s.L==[]:
+                        print "A constraint has been removed because it can not be violated"
+                    else:
+                        if s not in sac:
+                            sac.append(s)
+                        else:
+                            print "A constraint has been removed for redundancy"
+        self.soft_always_constraints=sac
+        
+        self.always_constraints=ac
+        
+        
+    def __str__(self):
+        
+        string="(define (problem "+self.name+")\n"
+        string+="(:domain "+self.domain_name+")\n"
+        
+        string+="(:init"
+        for ie in self.init_state:
+            string+="\n\t"+str(ie)
+        string+=")\n"
+        
+        
+        string+="(:goal "
+        if len(self.goal_state)==0: 
+            string+="()"
+        elif len(self.goal_state)==1: 
+            string+=str(self.goal_state.pop())
+        else:
+            string+="(and"
+            for g in self.goal_state:
+                string+="\n\t "+str(g)
+            string+=")\n"
+        string+=")\n"
+        
+        string+="(:metric minimize (total-cost))\n"        
+        
+        string+=")"
+        return string
+
+class New_Action():
+    
+    def __init__(self,a=None,tup=None, disjunctive_precond=None):
+        self.name,self.precond,self.eff = tup
+        self.disjunctive_precond=disjunctive_precond
+            
+        self.eff_add=set() 
+        self.eff_del=set()
+        for e in self.eff:
+            if e.isNegate:
+                self.eff_del.add(e)
+            else:
+                self.eff_add.add(e)
+        
+        self.Z=self.calc_Z()
+        self.V=[] #the constraints that are violated by the action
+        self.T=[] #the constraints that are threated by the action
+        self.S=[] #the constraints that save the action
+        
+        
+    def __str__(self):
+        string="(:action "+self.name+"\n"
+        string+=":parameters ()\n"
+        string+=":precondition "
+        if self.disjunctive_precond is None or len(self.disjunctive_precond)==0:
+            if len(self.precond)==0: 
+                string+="()"
+            elif len(self.precond)==1: 
+                for p in self.precond:            
+                    string+=str(p)
+            else:
+                string+="(and"
+                for p in self.precond:
+                    string+=" "+str(p)
+                string+=")"
+        elif len(self.precond)==0:
+                if len(self.disjunctive_precond)==1:
+                    dp=self.disjunctive_precond[0]
+                    if len(dp)==1:
+                        for d in dp:
+                            string+=str(d)
+                    else:
+                        string+="(and"
+                        for d in dp:
+                            string+=" "+str(d)
+                        string+=")"
+                else:
+                    string+="(or"
+                    for dp in self.disjunctive_precond:
+                        if len(dp)==1:
+                            for d in dp:
+                                string+=" "+str(d)
+                        else:
+                            string+="(and"
+                            for d in dp:
+                                string+=" "+str(d)
+                            string+=")"
+                    string+=")"
+        else:
+            string+="(and"
+            for p in self.precond:
+                string+=" "+str(p)
+                        
+            for dp in self.disjunctive_precond:
+                if len(dp)==1:
+                    for d in dp:
+                        string+=" "+str(d)
+                else:
+                    string+="(or"
+                    for d in dp:
+                        string+=" "+str(d)
+                    string+=")"
+                
+            string+=")"
+        string+="\n"
+        
+        string+=":effect "
+        if len(self.eff)==0: 
+            string+="()"
+        elif len(self.eff)==1:
+            for e in self.eff:
+                string+=str(e)
+           
+        else:
+            string+="(and"
+            for e in self.eff:
+                string+=" "+str(e)
+            string+=")"
+        string+="\n)\n"
+        
+        return string
+        
+    
+
+    def calc_Z(self):
+        neg_eff_del=set()
+        for e in self.eff_del:
+            neg_eff_del.add(copy.copy(e).negate())
+        return (self.precond-neg_eff_del) | self.eff_add | self.eff_del
+        
+        
+class Soft_Always_Constr():
+    def __init__(self,prop,name,static_init,static_lit,pred):
+        self.name=name
+        self.always_violated=False
+        if isinstance(prop,ds.Literal):
+            prop=prop.ground_predicate()
+            self.L=[set([prop])]
+            prop_c=copy.copy(prop)
+            prop_c.negate()
+            self.L_bar=[set([prop_c])]
+            #recognize static_predicates
+            self.simplify_static_pred(static_init,static_lit,pred)
+        else:
+            cnf=[]            
+            #4th stage of conversion in CNF: DISTRIBUTE OR OVER AND
+            try:
+                
+                prop.normalize() #(a AND (b AND c)) becomes (a AND b AND c)
+                
+                cnf=prop.distribute() #Distribution of or over and
+                
+            except:
+                print("Distribution of OR over AND failed")
+
+                       
+            
+            self.L=map(set,cnf)
+            self.L_bar=[]            
+            for disj in cnf:
+                disj_bar=[]
+                for l in disj: 
+                    l1=copy.copy(l) #the copy is needed to not change the original literal
+                    l1.negate()
+                    disj_bar.append(l1)
+                self.L_bar.append(set(disj_bar))
+                                
+            
+            #recognize tautologies
+            i=0
+            while i < len(self.L):
+                intersection=self.L[i] & self.L_bar[i]
+                if len(intersection)!=0:
+                    self.L.pop(i)
+                    self.L_bar.pop(i)
+                    i=i-1
+                i=i+1
+            
+            
+            #recognize static_predicates
+            self.simplify_static_pred(static_init,static_lit,pred)
+            
+        
+        self.V_op=[] #the actions that violate the constraint
+        self.T_op=[] #the actions that threat the constraint
+        self.S_op=[] #the actions that are safe for the constraint
+    
+    def __eq__(self,other):
+        L2=other.L
+               
+        for s in self.L:
+            if s not in L2:
+                return False
+            
+        return True
+    
+    
+        
+    def simplify_static_pred(self,static_init,static_lit,pred):
+        
+        pred_neg=negateSet(pred)
+        static_init2=set()
+                  
+        
+        #ground static_init
+        for s in static_init:
+            l=s.ground_predicate()
+            static_init2.add(l)
+        #creating a set with all the predicates and their negation
+        
+        pred_tot= pred_neg | pred
+        #from all the subset (disjunction), substract the predicate set  
+        
+        
+        
+        i=0        
+        while i < len(self.L):
+            #clean = predicates
+            cont_bool=False
+            disj_list=list(self.L[i])
+            j=0
+            while j < len(disj_list):
+                if disj_list[j].predicate=="#true#":
+                    self.L.pop(i)
+                    self.L_bar.pop(i)
+                    cont_bool=True
+                    break
+                  
+                elif disj_list[j].predicate=="#false#":
+                    
+                    if len(disj_list)==1:
+                        self.L=None
+                        self.L_bar=None
+                        return
+                    else:
+                        l=disj_list.pop(j)
+                        j=j-1
+                        self.L[i].remove(l)
+                        stln=copy.copy(l)
+                        stln.negate()
+                        self.L_bar[i].remove(stln)                      
+                j=j+1
+            if cont_bool:
+                continue                            
+            
+            sub=self.L[i] - pred_tot #sub contains all the static literals of a subset of L
+                        
+            sub_list=list(sub)
+            j=0
+            while j<len(sub_list):
+                
+                if ds.Literal(sub_list[j].predicate) in static_init2: #the static literal will be always true
+                    if sub_list[j].isNegate: #always FALSE
+                        if len(self.L[i])==1:
+                            self.L=None
+                            self.L_bar=None
+                            return
+                        else:
+                            stl= sub_list.pop(j)
+                            j=j-1
+                            self.L[i].remove(stl)
+                            stln=copy.copy(stl)
+                            stln.negate()
+                            self.L_bar[i].remove(stln)
+                                                        
+                    else: #always TRUE
+                        self.L.pop(i)
+                        self.L_bar.pop(i)
+                        i=i-1
+                        break
+                else: #the static literal will be always false
+                    if not sub_list[j].isNegate: #always FALSE
+                        if len(self.L[i])==1:
+                            self.L=None
+                            self.L_bar=None
+                            return
+                        else:
+                            stl= sub_list.pop(j)
+                            j=j-1
+                            self.L[i].remove(stl)
+                            stln=copy.copy(stl)
+                            stln.negate()
+                            self.L_bar[i].remove(stln)
+                            
+                    else: #always TRUE
+                        self.L.pop(i)
+                        self.L_bar.pop(i)
+                        i=i-1
+                        break
+                j=j+1
+            i=i+1
+        
+        
+    def __str__(self):
+        if len(self.L)==0: #no literals
+            return ""
+        if len(self.L)==1: #only a conjunction
+            if len(self.L[0])==1: #only a proposition
+                return str(self.L[0].pop())
+            else: #more proposition -> a disjunction
+                string=" (or" 
+                for l in self.L[0]:
+                    string+=" "+str(l)
+                string+=")"
+                return string
+                
+        string="(and"
+        for d in self.L: #for each disjunction
+            if len(d)==1:
+                for l in d:
+                    string+=" "+str(l)
+            else:
+                string+=" (or" 
+                for l in d:
+                    string+=" "+str(l)
+                string+=")"
+        string+=")"
+        return string
+
+
+def unpack_Constraint(gd):
+    '''
+    this function is needed for unpack from a preference the propositions in soft always constraints 
+    '''
+    
+    if isinstance(gd,ds.Trajectory_GD):
+        if gd.traj_op=="always":
+            return gd.gd1
+        #in future it will be possible to add here more groups of constraints, not only always
+    elif isinstance(gd,ds.And_Or_GD): #it's a AND sentence
+        new_gd_list=[]
+        for g in gd.gd_list:
+            if isinstance(g,ds.Trajectory_GD) and g.traj_op=="always":
+                new_gd_list.append(g.gd1)
+            else:
+                raise Exception
+        return ds.And_Or_GD('and',new_gd_list)
+    
+    return None
+
+def negateSet(s):
+    res=set()
+    for l in s:
+        ln=copy.copy(l)
+        ln.negate()
+        res.add(ln)
+    return res
+    
+def distribute(lit_list,precond):
+    res=[]
+    for setl in lit_list:
+        new_p=precond | setl
+        res.append(new_p)
+        
+    return res
+
+
+def resolution(dp,pc):
+    #disj prec is a list of set representing disjunctions [(a or b or c), (d or e or f)]
+    #prec is a set of literals representing a conjunction (a and b and c)
+    disj_prec=dp
+    prec=pc
+    for p in prec:
+        for s in disj_prec:
+            if p in s:
+                disj_prec.remove(s)
+            else:
+                p_neg=copy.copy(p).negate()
+                #p_neg=-p
+                if p_neg in s:
+                    s.remove(p_neg)
+                    if len(s)==0:
+                        return None,None
+                    if disj_prec.count(s)==2:
+                        disj_prec.remove(s)
+    
+    return disj_prec,prec
+    
+    

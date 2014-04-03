@@ -1,0 +1,8 @@
+digit_no_zero = anything:x ?(x in '123456789') -> x
+number = spaces ('-' |'+' | -> ''):sign (<((digit_no_zero digit*)|digit)>:ds) ((<('.' digit*)>:f_part -> float(sign+ds+f_part))| -> int(sign + ds))
+var_str = <(('_' | -> '') letter letterOrDigit*)>:var_n -> var_n
+op = ws ('=' (-> 0) | '<' (-> 1) | '>' (-> 2) )
+expr = ws number | ws var_str
+cond = expr:a op:op_s expr:b -> d.Cond(a,op_s,b)
+if_instr = 'if ' cond:c ' then ' instr:inc_in -> d.If_instr(c,inc_in)
+instr = (if_instr:int_ins | (var_str:n_var ws ':=' ws number:val_var (->d.Ass_instr(n_var,val_var))):int_ins ) -> d.Instr(int_ins)
